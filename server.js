@@ -1,5 +1,7 @@
 'use strict'
 
+require('dotenv').config()
+
 const fs = require('fs')
 const path = require('path')
 const fastify = require('fastify')({ logger: false })
@@ -35,6 +37,18 @@ const openai = process.env.NVIDIA_API_KEY
 if (!openai) {
   console.warn('AVISO: NVIDIA_API_KEY não definida — todas as mensagens retornarão {type: "none"}')
 }
+
+// Documentação da API: Swagger UI em /docs (spec em /docs/json)
+fastify.register(require('@fastify/swagger'), {
+  openapi: {
+    info: {
+      title: 'mc-chat-api-server',
+      description: 'Recebe mensagens do chat do Minecraft e decide ações (command/chat/none) via LLM',
+      version: '1.0.0',
+    },
+  },
+})
+fastify.register(require('@fastify/swagger-ui'), { routePrefix: '/docs' })
 
 // Schema que a LLM é obrigada a seguir (structured outputs)
 const ACTION_SCHEMA = {
@@ -147,35 +161,6 @@ const actionResponseSchema = {
   },
 }
 
-fastify.post('/chat', {
-  schema: {
-    body: chatMessageSchema,
-    response: { 200: actionResponseSchema },
-  },
-}, async (request, reply) => {
-  const body = request.body
-  console.log(`[${body.type}] ${body.senderName ?? 'SISTEMA'}: ${body.message}`)
-  pushMessage(body)
-
-  try {
-    const action = await decideAction(body)
-    if (action.type !== 'command' && action.type !== 'chat') {
-      return { type: 'none', value: '' }
-    }
-    // O modelo às vezes inclui a barra inicial apesar da instrução
-    if (action.type === 'command') action.value = action.value.replace(/^\//, '')
-    // Registra a própria ação no histórico para a LLM ter memória do que fez
-    if (action.type === 'chat') {
-      pushMessage({ type: 'chat', message: action.value, senderName: 'BOT', senderUuid: null, timestamp: Date.now() })
-    }
-    return action
-  } catch (err) {
-    // Nunca derruba o fluxo do jogo: erro na LLM vira "none"
-    console.error('Erro ao decidir ação:', err.message)
-    return { type: 'none', value: '' }
-  }
-})
-
 const messageResponseItem = {
   type: 'object',
   properties: {
@@ -189,62 +174,112 @@ const messageResponseItem = {
   },
 }
 
-fastify.get('/chat', {
-  schema: {
-    querystring: {
-      type: 'object',
-      properties: {
-        limit: { type: 'integer', minimum: 1, maximum: 1000, default: 100 },
-        senderUuid: { type: 'string', pattern: UUID_PATTERN },
-      },
+// Rotas num plugin registrado DEPOIS do swagger: garante que o swagger já
+// carregou e captura os schemas de todas as rotas na documentação
+fastify.register(async function routes(fastify) {
+  fastify.post('/chat', {
+    schema: {
+      summary: 'Recebe uma mensagem do chat e decide a ação',
+      description: 'A LLM decide entre command (comando do servidor), chat (mensagem no chat) ou none.',
+      tags: ['chat'],
+      body: chatMessageSchema,
+      response: { 200: actionResponseSchema },
     },
-    response: {
-      200: {
+  }, async (request, reply) => {
+    const body = request.body
+    console.log(`[${body.type}] ${body.senderName ?? 'SISTEMA'}: ${body.message}`)
+    pushMessage(body)
+
+    try {
+      const action = await decideAction(body)
+      if (action.type !== 'command' && action.type !== 'chat') {
+        return { type: 'none', value: '' }
+      }
+      // O modelo às vezes inclui a barra inicial apesar da instrução
+      if (action.type === 'command') action.value = action.value.replace(/^\//, '')
+      // Registra a própria ação no histórico para a LLM ter memória do que fez
+      if (action.type === 'chat') {
+        pushMessage({ type: 'chat', message: action.value, senderName: 'BOT', senderUuid: null, timestamp: Date.now() })
+      }
+      return action
+    } catch (err) {
+      // Nunca derruba o fluxo do jogo: erro na LLM vira "none"
+      console.error('Erro ao decidir ação:', err.message)
+      return { type: 'none', value: '' }
+    }
+  })
+
+  fastify.get('/chat', {
+    schema: {
+      summary: 'Lista as mensagens mais recentes',
+      tags: ['chat'],
+      querystring: {
         type: 'object',
         properties: {
-          total: { type: 'integer' },
-          count: { type: 'integer' },
-          messages: { type: 'array', items: messageResponseItem },
+          limit: { type: 'integer', minimum: 1, maximum: 1000, default: 100 },
+          senderUuid: { type: 'string', pattern: UUID_PATTERN },
+        },
+      },
+      response: {
+        200: {
+          type: 'object',
+          properties: {
+            total: { type: 'integer' },
+            count: { type: 'integer' },
+            messages: { type: 'array', items: messageResponseItem },
+          },
         },
       },
     },
-  },
-}, (request, reply) => {
-  const { limit, senderUuid } = request.query
-  const stored = Math.min(total, MAX_MESSAGES)
-  const messages = []
-  for (let i = 1; i <= stored && messages.length < limit; i++) {
-    const msg = buffer[(head - i + MAX_MESSAGES) % MAX_MESSAGES]
-    if (!senderUuid || msg.senderUuid === senderUuid) messages.push(msg)
-  }
-  reply.send({ total, count: messages.length, messages })
-})
+  }, (request, reply) => {
+    const { limit, senderUuid } = request.query
+    const stored = Math.min(total, MAX_MESSAGES)
+    const messages = []
+    for (let i = 1; i <= stored && messages.length < limit; i++) {
+      const msg = buffer[(head - i + MAX_MESSAGES) % MAX_MESSAGES]
+      if (!senderUuid || msg.senderUuid === senderUuid) messages.push(msg)
+    }
+    reply.send({ total, count: messages.length, messages })
+  })
 
-// Contexto da LLM: consultar e atualizar em tempo de execução
-fastify.get('/context', (request, reply) => {
-  reply.type('text/plain').send(context)
-})
-
-fastify.put('/context', {
-  schema: {
-    body: {
-      type: 'object',
-      required: ['context'],
-      properties: { context: { type: 'string', minLength: 1, maxLength: 100000 } },
+  // Contexto da LLM: consultar e atualizar em tempo de execução
+  fastify.get('/context', {
+    schema: {
+      summary: 'Retorna o contexto atual da LLM (texto puro)',
+      tags: ['contexto'],
     },
-  },
-}, async (request, reply) => {
-  context = request.body.context
-  await fs.promises.writeFile(CONTEXT_FILE, context)
-  return { ok: true }
-})
+  }, (request, reply) => {
+    reply.type('text/plain').send(context)
+  })
 
-fastify.get('/health', (request, reply) => {
-  reply.send({
-    status: 'ok',
-    llm: openai ? MODEL : 'desabilitada (sem NVIDIA_API_KEY)',
-    stored: Math.min(total, MAX_MESSAGES),
-    total,
+  fastify.put('/context', {
+    schema: {
+      summary: 'Substitui o contexto da LLM',
+      tags: ['contexto'],
+      body: {
+        type: 'object',
+        required: ['context'],
+        properties: { context: { type: 'string', minLength: 1, maxLength: 100000 } },
+      },
+    },
+  }, async (request, reply) => {
+    context = request.body.context
+    await fs.promises.writeFile(CONTEXT_FILE, context)
+    return { ok: true }
+  })
+
+  fastify.get('/health', {
+    schema: {
+      summary: 'Status do servidor e da LLM',
+      tags: ['sistema'],
+    },
+  }, (request, reply) => {
+    reply.send({
+      status: 'ok',
+      llm: openai ? MODEL : 'desabilitada (sem NVIDIA_API_KEY)',
+      stored: Math.min(total, MAX_MESSAGES),
+      total,
+    })
   })
 })
 
