@@ -14,14 +14,15 @@ const HISTORY_FOR_LLM = Number(process.env.HISTORY_FOR_LLM) || 20
 const MODEL = process.env.NVIDIA_MODEL || 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning'
 const CONTEXT_FILE = path.join(__dirname, 'context.md')
 
-const DEFAULT_CONTEXT = `Você é um assistente dentro de um servidor de Minecraft.
+const DEFAULT_CONTEXT = `Você é um assistente dentro de um servidor de Minecraft (Java Edition 1.21.8).
 Você recebe mensagens do chat e decide se deve agir.
 
 Regras:
-- Se um jogador pedir um item de forma razoável, dê o item com /give.
-- Se alguém fizer uma pergunta ou conversar com você, responda pelo chat de forma curta e amigável.
+- Atenda pedidos razoáveis de itens (máximo 64 por pedido).
+- Tarefas no mundo (minerar/coletar, ir a coordenadas, seguir alguém) são feitas com as ferramentas do Baritone.
+- Se alguém fizer uma pergunta ou conversar com você, responda de forma curta e amigável.
 - Para mensagens que não pedem nada de você, não faça nada.
-- Nunca execute comandos destrutivos (/op, /ban, /stop, /kill em outros jogadores, etc).
+- Nunca execute ações destrutivas contra jogadores.
 `
 
 let context = DEFAULT_CONTEXT
@@ -50,34 +51,153 @@ fastify.register(require('@fastify/swagger'), {
 })
 fastify.register(require('@fastify/swagger-ui'), { routePrefix: '/docs' })
 
-// Schema que a LLM é obrigada a seguir (structured outputs)
-const ACTION_SCHEMA = {
-  type: 'object',
-  properties: {
-    type: {
-      type: 'string',
-      enum: ['command', 'chat', 'none'],
-      description:
-        'command = executa value como comando do Minecraft; chat = envia value como mensagem no chat; none = não faz nada',
-    },
-    value: {
-      type: 'string',
-      description:
-        'O comando (sem / inicial) ou a mensagem de chat. String vazia quando type é none.',
+// Ações disponíveis como ferramentas tipadas: o modelo escolhe uma (ou
+// nenhuma) e o servidor traduz para a ação {type, value} que o mod executa
+const TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'give',
+      description: 'Dá um item a um jogador via /give do servidor',
+      parameters: {
+        type: 'object',
+        properties: {
+          player: { type: 'string', description: 'Nome do jogador (nunca @s/@p)' },
+          item_id: {
+            type: 'string',
+            description:
+              'ID oficial de ITEM do Java Edition 1.21.8: inglês, snake_case, sem prefixo minecraft: (ex: diamond, iron_pickaxe, golden_apple, oak_log)',
+          },
+          quantity: { type: 'integer', minimum: 1, maximum: 64, description: 'Quantidade (padrão 1)' },
+        },
+        required: ['player', 'item_id'],
+      },
     },
   },
-  required: ['type', 'value'],
-  additionalProperties: false,
+  {
+    type: 'function',
+    function: {
+      name: 'baritone_mine',
+      description: 'Minera/coleta blocos no mundo com o Baritone (pedidos como "pega madeira", "cava diamante")',
+      parameters: {
+        type: 'object',
+        properties: {
+          block_ids: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'IDs oficiais de BLOCO do Java Edition 1.21.8 em snake_case, completos (ex: madeira -> ["oak_log"], pedra -> ["stone"]). Para minérios inclua a variante deepslate (ex: ["diamond_ore", "deepslate_diamond_ore"])',
+          },
+        },
+        required: ['block_ids'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'baritone_goto',
+      description: 'Anda até coordenadas com o Baritone',
+      parameters: {
+        type: 'object',
+        properties: {
+          x: { type: 'integer' },
+          y: { type: 'integer' },
+          z: { type: 'integer' },
+        },
+        required: ['x', 'y', 'z'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'baritone_follow',
+      description: 'Segue um jogador com o Baritone (pedidos como "me segue", "vem comigo")',
+      parameters: {
+        type: 'object',
+        properties: { player: { type: 'string', description: 'Nome do jogador a seguir' } },
+        required: ['player'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'baritone_stop',
+      description: 'Para a tarefa atual do Baritone (pedidos pra parar, cancelar, "esquece")',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'say',
+      description: 'Envia uma mensagem curta (1 a 2 frases) no chat do jogo',
+      parameters: {
+        type: 'object',
+        properties: { text: { type: 'string' } },
+        required: ['text'],
+      },
+    },
+  },
+]
+
+// Validação defensiva: os argumentos da LLM viram comando executado no servidor
+const SAFE_MC_ID = /^[a-z0-9_]+$/
+const SAFE_PLAYER = /^[A-Za-z0-9_]{1,16}$/
+
+// Minérios que têm variante deepslate no 1.21.8
+const DEEPSLATE_ORES = new Set([
+  'coal_ore', 'copper_ore', 'diamond_ore', 'emerald_ore',
+  'gold_ore', 'iron_ore', 'lapis_ore', 'redstone_ore',
+])
+
+// O modelo às vezes manda o ID com o prefixo minecraft:, às vezes sem
+function stripNamespace(id) {
+  return String(id ?? '').replace(/^minecraft:/, '')
+}
+
+function toolToAction(name, args) {
+  switch (name) {
+    case 'give': {
+      const itemId = stripNamespace(args.item_id)
+      if (!SAFE_PLAYER.test(args.player) || !SAFE_MC_ID.test(itemId)) break
+      const quantity = Math.min(Math.max(1, Math.trunc(args.quantity ?? 1)), 64)
+      return { type: 'command', value: `give ${args.player} ${itemId} ${quantity}` }
+    }
+    case 'baritone_mine': {
+      const ids = (args.block_ids ?? []).map(stripNamespace).filter((id) => SAFE_MC_ID.test(id))
+      // Garante a variante deepslate dos minérios mesmo se o modelo esquecer
+      for (const id of [...ids]) {
+        if (DEEPSLATE_ORES.has(id) && !ids.includes(`deepslate_${id}`)) ids.push(`deepslate_${id}`)
+      }
+      if (ids.length === 0) break
+      return { type: 'chat', value: `#mine ${ids.map((id) => `minecraft:${id}`).join(' ')}` }
+    }
+    case 'baritone_goto':
+      if (![args.x, args.y, args.z].every(Number.isInteger)) break
+      return { type: 'chat', value: `#goto ${args.x} ${args.y} ${args.z}` }
+    case 'baritone_follow':
+      if (!SAFE_PLAYER.test(args.player)) break
+      return { type: 'chat', value: `#follow player ${args.player}` }
+    case 'baritone_stop':
+      return { type: 'chat', value: '#stop' }
+    case 'say':
+      if (typeof args.text !== 'string' || !args.text.trim()) break
+      return { type: 'chat', value: args.text.trim() }
+  }
+  console.warn(`Tool call inválida descartada: ${name} ${JSON.stringify(args)}`)
+  return { type: 'none', value: '' }
 }
 
 const BASE_SYSTEM = `Você controla um bot em um servidor de Minecraft via API.
-A cada mensagem do chat você decide UMA ação:
-- "command": executar um comando do servidor (ex: give Steve diamond 1). Use o nome do jogador, não @s, pois o comando roda pelo servidor/mod.
-- "chat": enviar uma mensagem de texto no chat do jogo.
-- "none": não fazer nada.
-
-Mensagens com senderName null são mensagens de sistema do jogo (type "game"), não de jogadores.
-Seja conservador: na dúvida, use "none". Mensagens de chat devem ser curtas (1 a 2 frases).`
+A cada mensagem do chat você decide: chamar UMA ferramenta (no máximo uma) ou nenhuma.
+- Pedidos dirigidos diretamente ao bot devem ser atendidos com a ferramenta adequada.
+- Não aja em mensagens que não pedem nada de você (conversa entre jogadores, mensagens de sistema).
+- Comandos rodam pelo servidor: use sempre o nome do jogador, nunca @s/@p.
+- Mensagens com senderName null são mensagens de sistema do jogo (type "game"), não de jogadores.
+- Nunca invente IDs de item/bloco: se não tiver certeza, use say pra pedir confirmação.`
 
 // Ring buffer em memória: O(1) para inserir, sem realocação
 const buffer = new Array(MAX_MESSAGES)
@@ -110,16 +230,13 @@ async function decideAction(incoming) {
   const completion = await openai.chat.completions.create({
     model: MODEL,
     // O modelo é de reasoning (thinking não desliga): budget baixo segura a
-    // latência e max_tokens cobre thinking + JSON final
+    // latência e max_tokens cobre thinking + tool call
     max_tokens: 2048,
     reasoning_budget: 1024,
     temperature: 0.2,
     top_p: 0.95,
-    // Saída validada contra o schema (structured output OpenAI-compatible)
-    response_format: {
-      type: 'json_schema',
-      json_schema: { name: 'action', schema: ACTION_SCHEMA, strict: true },
-    },
+    tools: TOOLS,
+    tool_choice: 'auto',
     messages: [
       {
         role: 'system',
@@ -132,9 +249,10 @@ async function decideAction(incoming) {
     ],
   })
 
-  const text = completion.choices[0]?.message?.content
-  if (!text) return { type: 'none', value: '' }
-  return JSON.parse(text)
+  // Sem tool call = o modelo decidiu não agir
+  const call = completion.choices[0]?.message?.tool_calls?.[0]
+  if (!call) return { type: 'none', value: '' }
+  return toolToAction(call.function.name, JSON.parse(call.function.arguments || '{}'))
 }
 
 const UUID_PATTERN =
@@ -193,10 +311,12 @@ fastify.register(async function routes(fastify) {
     try {
       const action = await decideAction(body)
       if (action.type !== 'command' && action.type !== 'chat') {
+        console.log('→ none')
         return { type: 'none', value: '' }
       }
       // O modelo às vezes inclui a barra inicial apesar da instrução
       if (action.type === 'command') action.value = action.value.replace(/^\//, '')
+      console.log(`→ ${action.type}: ${action.value}`)
       // Registra a própria ação no histórico para a LLM ter memória do que fez
       if (action.type === 'chat') {
         pushMessage({ type: 'chat', message: action.value, senderName: 'BOT', senderUuid: null, timestamp: Date.now() })
